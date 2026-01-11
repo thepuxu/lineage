@@ -1,0 +1,13 @@
+# Ignore everything
+*
+
+# Except .py files
+!*.py
+
+# And .gitignore itself
+!.gitignore
+
+# But still ignore Python cache/compiled files
+__pycache__/
+*.py[cod]
+*$py.class
