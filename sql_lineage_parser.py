@@ -916,6 +916,14 @@ def build_scope_tree(ast: exp.Expression, name: str = "ROOT", parent: Optional[S
         # Use first branch projections for column names
         if scope.union_branches:
             scope.projections = scope.union_branches[0].projections.copy()
+
+            # FIX 17A: Make branch aliases visible at union scope level
+            # This allows find_relation_in_scope_chain to find aliases like STG_CARDS
+            # that are defined inside union branches
+            for branch in scope.union_branches:
+                for alias, rel in branch.relations.items():
+                    if alias not in scope.relations:  # First-branch precedence
+                        scope.relations[alias] = rel
         return scope
 
     # Find SELECT clause
@@ -1152,6 +1160,12 @@ def _register_from_sources(from_clause: exp.From, scope: Scope, name: str,
             if alias:
                 child = build_scope_tree(source.this, f"{name}/{alias.upper()}", scope, dm_dict)
                 scope.relations[alias.upper()] = child
+            else:
+                # Anonymous subquery (no alias) - still need to build and link it
+                # Use synthetic name for the scope, register as __ANON__ so resolution can find it
+                child = build_scope_tree(source.this, f"{name}/__ANON__", scope, dm_dict)
+                scope.relations["__ANON__"] = child
+                logger.debug(f"Registered anonymous subquery in FROM clause for scope {name}")
 
 
 def _register_join_source(join: exp.Join, scope: Scope, name: str,
@@ -1299,6 +1313,22 @@ def find_relation_in_scope_chain(alias: str, scope: Scope) -> Optional[Union[str
     physical = find_physical_in_nested(scope, alias)
     if physical:
         return physical
+
+    # FIX 17B: Search union branches for alias
+    # When resolving STG_CARDS.X in a UNION scope, the alias STG_CARDS
+    # lives inside union_branches, not in scope.relations directly
+    for branch in scope.union_branches:
+        if alias in branch.relations:
+            return branch.relations[alias]
+        if alias in branch.ctes:
+            return branch.ctes[alias]
+        # Also search nested within each branch
+        nested = _find_scope_by_alias(branch, alias)
+        if nested:
+            return nested
+        physical = find_physical_in_nested(branch, alias)
+        if physical:
+            return physical
 
     # Walk up to parent
     if scope.parent:
@@ -1497,11 +1527,25 @@ def resolve_to_physical(
             # (not just CTEs - any child scope should reset to avoid ping-pong cycles)
             visited = set()
 
-            # Handle UNION scopes - resolve from ALL branches
+            # Handle UNION scopes - resolve by name, then by position (FIX 17D)
+            # SQL UNION aligns columns by POSITION, not name. First branch defines output names.
             if relation.union_branches:
                 all_results: List[ResolvedColumn] = []
+
+                # Get first branch (defines output column names at UNION level)
+                first = relation.union_branches[0]
+                first_names = list(first.projections.keys())  # Insertion order preserved (Python 3.7+)
+
+                # Determine the target index from the first branch
+                target_idx: Optional[int] = None
+                try:
+                    target_idx = first_names.index(column.upper())
+                except ValueError:
+                    pass  # Name not found in first branch
+
                 for branch in relation.union_branches:
                     if column.upper() in branch.projections:
+                        # Name match - use directly
                         proj = branch.projections[column.upper()]
                         branch_results = resolve_expression(
                             proj.expression,
@@ -1512,6 +1556,22 @@ def resolve_to_physical(
                             max_depth
                         )
                         all_results.extend(branch_results)
+                    elif target_idx is not None:
+                        # FIX 17D: Position fallback - get N-th projection from this branch
+                        branch_names = list(branch.projections.keys())
+                        if target_idx < len(branch_names):
+                            positional_col = branch_names[target_idx]
+                            proj = branch.projections[positional_col]
+                            branch_results = resolve_expression(
+                                proj.expression,
+                                branch,
+                                dm_dict,
+                                visited.copy(),
+                                trace + [branch.name],
+                                max_depth
+                            )
+                            all_results.extend(branch_results)
+
                 if all_results:
                     return all_results
                 # Fall through to MISSING_PROJECTION if no results
@@ -1535,11 +1595,16 @@ def resolve_to_physical(
             def find_column_in_nested(s: Scope, col: str) -> Optional[Scope]:
                 if col.upper() in s.projections:
                     return s
-                for _, rel in s.relations.items():
+                for alias, rel in s.relations.items():
                     if isinstance(rel, Scope):
                         found = find_column_in_nested(rel, col)
                         if found:
                             return found
+                # FIX 17C: Also search union branches
+                for branch in s.union_branches:
+                    found = find_column_in_nested(branch, col)
+                    if found:
+                        return found
                 return None
 
             nested_with_col = find_column_in_nested(relation, column)
@@ -1566,10 +1631,23 @@ def resolve_to_physical(
     # STEP 4: Unqualified column
     else:
         # Handle UNION scopes for unqualified columns (top-level UNION)
+        # FIX 17D: Use position-based matching when names differ across branches
         if scope.union_branches:
             all_results: List[ResolvedColumn] = []
+
+            # Get first branch (defines output column names at UNION level)
+            first = scope.union_branches[0]
+            first_names = list(first.projections.keys())  # Insertion order preserved
+
+            # Determine the target index from the first branch
+            target_idx: Optional[int] = None
+            try:
+                target_idx = first_names.index(column.upper())
+            except ValueError:
+                pass  # Name not found in first branch
+
             for branch in scope.union_branches:
-                # First try projections
+                # First try projections by name
                 if column.upper() in branch.projections:
                     proj = branch.projections[column.upper()]
                     branch_results = resolve_expression(
@@ -1581,6 +1659,21 @@ def resolve_to_physical(
                         max_depth
                     )
                     all_results.extend(branch_results)
+                elif target_idx is not None:
+                    # FIX 17D: Position fallback - get N-th projection from this branch
+                    branch_names = list(branch.projections.keys())
+                    if target_idx < len(branch_names):
+                        positional_col = branch_names[target_idx]
+                        proj = branch.projections[positional_col]
+                        branch_results = resolve_expression(
+                            proj.expression,
+                            branch,
+                            dm_dict,
+                            visited.copy(),
+                            trace + [branch.name],
+                            max_depth
+                        )
+                        all_results.extend(branch_results)
                 else:
                     # Column not in projections - try resolving directly in branch
                     # This handles source columns (e.g., CREDIT_LIMIT) vs projected names (e.g., AMOUNT)
@@ -1613,7 +1706,12 @@ def resolve_to_physical(
                 # Check if it's a qualified reference to the same column
                 ref_alias, ref_col = parse_ref(expr_refs[0])
                 if ref_col.upper() == column.upper():
-                    is_identity = True  # Qualified identity (e.g., ALIAS.SAME_COL)
+                    # FIX 17E: Only treat as identity if the alias is NOT a relation in current scope
+                    # If alias IS a relation (child scope), resolve normally to get all UNION branches
+                    if ref_alias and ref_alias.upper() in scope.relations:
+                        is_identity = False  # Not identity - it's a reference to a child scope
+                    else:
+                        is_identity = True  # Qualified identity (e.g., ALIAS.SAME_COL from parent)
 
             if not is_identity:
                 return resolve_expression(
@@ -1662,6 +1760,17 @@ def resolve_to_physical(
                     proj = current_scope.projections[col.upper()]
                     refs = extract_column_refs(proj.expression)
 
+                    # FIX 16: Check if expression is a constant (no column refs)
+                    if not refs:
+                        expr_stripped = proj.expression.strip()
+                        if is_constant(expr_stripped):
+                            return [ResolvedColumn(
+                                source_type=SourceType.CONSTANT,
+                                constant_value=expr_stripped,
+                                trace_path="->".join(path) + f":CONSTANT({expr_stripped})"
+                            )]
+                        # If not a constant and no refs, fall through (will return empty results)
+
                     for r in refs:
                         ref_alias, ref_col = parse_ref(r)
                         if ref_alias:
@@ -1679,11 +1788,13 @@ def resolve_to_physical(
                                 deeper = trace_to_physical(rel, ref_col, path + [rel.name], depth + 1)
                                 results.extend(deeper)
                         else:
-                            # Unqualified ref - check all relations in current scope
+                            # Unqualified ref - PRIORITIZE child scopes over physical tables
+                            scope_results: List[ResolvedColumn] = []
+                            physical_results: List[ResolvedColumn] = []
                             for child_alias, child_rel in current_scope.relations.items():
                                 if isinstance(child_rel, str):
                                     dm = "Y" if column_exists_in_dm(child_rel, ref_col, dm_dict) else "N"
-                                    results.append(ResolvedColumn(
+                                    physical_results.append(ResolvedColumn(
                                         source_type=SourceType.PHYSICAL,
                                         table=child_rel,
                                         column=ref_col,
@@ -1692,7 +1803,12 @@ def resolve_to_physical(
                                     ))
                                 elif isinstance(child_rel, Scope) and ref_col.upper() in child_rel.projections:
                                     deeper = trace_to_physical(child_rel, ref_col, path + [child_rel.name], depth + 1)
-                                    results.extend(deeper)
+                                    scope_results.extend(deeper)
+                            # Prefer scope-derived results over physical tables
+                            if scope_results:
+                                results.extend(scope_results)
+                            elif physical_results:
+                                results.extend(physical_results)
 
                     return results
 
@@ -1702,11 +1818,26 @@ def resolve_to_physical(
                         if phys_candidates:
                             return phys_candidates  # Found physical source - return immediately
 
-                # REMOVED: Fallback to parent physical tables was picking wrong tables from JOINs
-                # (e.g., DESJ_CTR_MAPPING instead of STG_LOAN_CONTRACTS)
-                # Instead, if child scopes had nothing, return UNRESOLVED for debuggability
+                # FIX 18: If no child scopes but there ARE physical tables in current scope,
+                # the identity column must reference one of those physical tables.
+                # This handles innermost scopes like: SELECT D_CLOSE_DATE FROM STG_PREPAID_CARDS
+                # where D_CLOSE_DATE = D_CLOSE_DATE (identity to physical table column)
+                if not child_scopes_to_check:
+                    physical_results: List[ResolvedColumn] = []
+                    for alias_name, relation in scope.relations.items():
+                        if isinstance(relation, str):  # Physical table
+                            dm = "Y" if column_exists_in_dm(relation, column, dm_dict) else "N"
+                            physical_results.append(ResolvedColumn(
+                                source_type=SourceType.PHYSICAL,
+                                table=relation,
+                                column=column,
+                                dm_match=dm,
+                                trace_path="->".join(trace) + f":{relation}.{column}"
+                            ))
+                    if physical_results:
+                        return physical_results
 
-                # No child scope source found for identity column
+                # No child scope or physical table source found for identity column
                 debug_info = _generate_debug_info(column, scope, "COLUMN_NOT_FOUND (identity passthrough)")
                 return [ResolvedColumn(
                     source_type=SourceType.UNRESOLVED,
@@ -1715,13 +1846,17 @@ def resolve_to_physical(
                     column=column
                 )]
 
-        # Find in visible relations (physical tables AND CTE/subquery scopes)
-        candidates: List[ResolvedColumn] = []
+        # Find in visible relations - PRIORITIZE scopes over physical tables
+        # For unqualified columns, scope-derived results (from subqueries) should take precedence
+        # over physical JOINed tables to avoid picking wrong tables like DESJ_CTR_MAPPING
+        scope_candidates: List[ResolvedColumn] = []
+        physical_candidates: List[ResolvedColumn] = []
+
         for alias_name, relation in scope.relations.items():
             if isinstance(relation, str):
-                # Physical table - check DM
+                # Physical table - check DM (lower priority)
                 if column_exists_in_dm(relation, column, dm_dict):
-                    candidates.append(ResolvedColumn(
+                    physical_candidates.append(ResolvedColumn(
                         source_type=SourceType.PHYSICAL,
                         table=relation,
                         column=column,
@@ -1729,7 +1864,7 @@ def resolve_to_physical(
                         trace_path="->".join(trace) + f":{relation}.{column}"
                     ))
             elif isinstance(relation, Scope):
-                # CTE or subquery scope - check if column exists in its projections
+                # CTE or subquery scope - check if column exists in its projections (higher priority)
                 if column.upper() in relation.projections:
                     # Resolve through this scope
                     proj = relation.projections[column.upper()]
@@ -1741,30 +1876,24 @@ def resolve_to_physical(
                         trace + [relation.name],
                         max_depth
                     )
-                    candidates.extend(sub_results)
+                    scope_candidates.extend(sub_results)
 
-        if len(candidates) >= 1:
-            return candidates
-        elif len(candidates) == 0:
-            # Walk up to parent scope
-            if scope.parent:
-                return resolve_to_physical(ref, scope.parent, dm_dict, visited, trace, max_depth)
-            debug_info = _generate_debug_info(column, scope, "COLUMN_NOT_FOUND (no parent scope)")
-            return [ResolvedColumn(
-                source_type=SourceType.UNRESOLVED,
-                reason=f"{UnresolvedReason.COLUMN_NOT_FOUND.value} | {debug_info}",
-                trace_path="->".join(trace),
-                column=column
-            )]
-        else:
-            # Ambiguous
-            tables = [c.table for c in candidates]
-            return [ResolvedColumn(
-                source_type=SourceType.UNRESOLVED,
-                reason=f"{UnresolvedReason.AMBIGUOUS.value}; candidates={tables}",
-                trace_path="->".join(trace),
-                column=column
-            )]
+        # Prefer scope-derived results over physical table matches
+        if scope_candidates:
+            return scope_candidates
+        if physical_candidates:
+            return physical_candidates
+
+        # No candidates found - walk up to parent scope
+        if scope.parent:
+            return resolve_to_physical(ref, scope.parent, dm_dict, visited, trace, max_depth)
+        debug_info = _generate_debug_info(column, scope, "COLUMN_NOT_FOUND (no parent scope)")
+        return [ResolvedColumn(
+            source_type=SourceType.UNRESOLVED,
+            reason=f"{UnresolvedReason.COLUMN_NOT_FOUND.value} | {debug_info}",
+            trace_path="->".join(trace),
+            column=column
+        )]
 
     debug_info = _generate_debug_info(ref, scope, "COLUMN_NOT_FOUND (fallback)")
     return [ResolvedColumn(
