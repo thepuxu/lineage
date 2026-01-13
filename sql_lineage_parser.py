@@ -916,6 +916,11 @@ def build_scope_tree(ast: exp.Expression, name: str = "ROOT", parent: Optional[S
         """
         col_ref = col_ref.strip()
 
+        # FIX 23: Don't qualify non-column expressions (functions, subqueries)
+        # If ref contains spaces, parentheses, or newlines, it's not a simple column ref
+        if any(c in col_ref for c in ' ()\n\r\t'):
+            return col_ref  # Return as-is, let resolve_expression handle it
+
         # Already qualified with table
         if '.' in col_ref:
             return col_ref
