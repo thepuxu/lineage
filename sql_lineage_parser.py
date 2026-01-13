@@ -907,15 +907,60 @@ def build_scope_tree(ast: exp.Expression, name: str = "ROOT", parent: Optional[S
                 cte_scope = build_scope_tree(cte.this, f"{name}/CTE_{cte_name}", scope, dm_dict)
                 scope.ctes[cte_name] = cte_scope
 
+    # FIX 20: Merge UNION branch projections by position
+    def _merge_union_projections(union_scope: Scope) -> None:
+        """
+        Merge lineage across UNION branches by column position.
+        - Column names follow the first branch (SQL behavior).
+        - Lineage (source_refs) is the union of all branches for each position.
+        """
+        if not union_scope.union_branches:
+            return
+
+        first = union_scope.union_branches[0]
+        merged: Dict[str, ProjectionDef] = {}
+
+        # Build index -> name map from first branch
+        first_items = list(first.projections.items())
+
+        for idx, (col_name, base_proj) in enumerate(first_items):
+            # Start with first branch's source refs
+            combined_sources: List[str] = []
+            if base_proj.source_refs:
+                combined_sources.extend(base_proj.source_refs)
+            else:
+                combined_sources.append(base_proj.expression)
+
+            # Walk other branches and merge lineage at same position
+            for branch in union_scope.union_branches[1:]:
+                branch_items = list(branch.projections.items())
+                if idx < len(branch_items):
+                    _, branch_proj = branch_items[idx]
+                    # Get this branch's source refs
+                    branch_sources = branch_proj.source_refs or [branch_proj.expression]
+                    for src in branch_sources:
+                        if src not in combined_sources:
+                            combined_sources.append(src)
+
+            # Create merged projection (name from first branch, all sources accumulated)
+            merged[col_name.upper()] = ProjectionDef(
+                output_name=col_name,
+                expression=base_proj.expression,
+                source_refs=combined_sources,
+                origin_alias=base_proj.origin_alias
+            )
+
+        union_scope.projections = merged
+
     # Handle UNION
     if isinstance(ast, exp.Union):
         if ast.left:
             scope.union_branches.append(build_scope_tree(ast.left, f"{name}__UNION1", scope, dm_dict))
         if ast.right:
             scope.union_branches.append(build_scope_tree(ast.right, f"{name}__UNION2", scope, dm_dict))
-        # Use first branch projections for column names
+        # FIX 20: Merge projections from ALL branches (not just first)
         if scope.union_branches:
-            scope.projections = scope.union_branches[0].projections.copy()
+            _merge_union_projections(scope)
 
             # FIX 17A: Make branch aliases visible at union scope level
             # This allows find_relation_in_scope_chain to find aliases like STG_CARDS
