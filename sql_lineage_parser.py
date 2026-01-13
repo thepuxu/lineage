@@ -1033,6 +1033,10 @@ def build_scope_tree(ast: exp.Expression, name: str = "ROOT", parent: Optional[S
     # sql_file will be updated later when collecting joins in process_sql_file()
     scope.joins = _extract_scope_joins(select_expr, scope, object_name="", sql_file="")
 
+    # FIX 22: Register tables from EXISTS/IN subqueries in WHERE/HAVING clauses
+    # These need to be registered so that references like setup_master.column resolve
+    _register_exists_subquery_tables(select_expr, scope, name, dm_dict)
+
     # PASS 3: Register SELECT projections
     for item in select_expr.expressions:
         # Handle SELECT * - expand from all visible relations
@@ -1292,6 +1296,80 @@ def _register_parenthesized_join_tables(source: exp.Subquery, scope: Scope, name
             else:
                 scope.relations[alias_upper] = table_name
             logger.debug(f"Registered table from parenthesized join: {alias_upper} -> {table_name}")
+
+
+def _register_exists_subquery_tables(select_expr: exp.Select, scope: Scope, name: str,
+                                      dm_dict: Optional[Dict[str, Set[str]]] = None) -> None:
+    """
+    FIX 22: Register tables from EXISTS/IN subqueries in WHERE/HAVING clauses.
+
+    When SQL has patterns like:
+        WHERE EXISTS (SELECT 1 FROM setup_master WHERE setup_master.column = ...)
+
+    The table 'setup_master' needs to be registered as a relation so that
+    setup_master.column references can resolve.
+
+    For unaliased tables (FROM table_name), register table_name as both the
+    physical table reference AND as an alias (self-aliased).
+    """
+    # Find all EXISTS nodes in WHERE/HAVING clauses
+    for exists_node in select_expr.find_all(exp.Exists):
+        # Check if this EXISTS is nested inside another subquery (skip if so)
+        parent = exists_node.parent
+        is_nested_in_subquery = False
+        while parent and parent != select_expr:
+            if isinstance(parent, exp.Subquery):
+                is_nested_in_subquery = True
+                break
+            parent = parent.parent
+
+        if is_nested_in_subquery:
+            continue  # This EXISTS belongs to a child scope
+
+        # Get the subquery inside EXISTS
+        subquery = exists_node.this
+        if not subquery:
+            continue
+
+        # Find the SELECT inside the EXISTS
+        inner_select = subquery if isinstance(subquery, exp.Select) else subquery.find(exp.Select)
+        if not inner_select:
+            continue
+
+        # Find tables in the EXISTS subquery's FROM clause
+        from_clause = inner_select.find(exp.From)
+        if from_clause and from_clause.this:
+            source = from_clause.this
+            if isinstance(source, exp.Table):
+                table_name = source.name.upper() if source.name else ""
+                # For unaliased tables, use table name as alias (self-aliased)
+                alias = (source.alias or source.name)
+                if alias and table_name:
+                    alias_upper = alias.upper()
+                    if alias_upper not in scope.relations:
+                        # Check if this refers to a CTE
+                        cte_scope = _find_cte_in_scope_chain(table_name, scope)
+                        if cte_scope is not None:
+                            scope.relations[alias_upper] = cte_scope
+                        else:
+                            scope.relations[alias_upper] = table_name
+                        logger.debug(f"FIX 22: Registered table from EXISTS subquery: {alias_upper} -> {table_name}")
+
+        # Also handle JOINs inside the EXISTS subquery
+        for join in inner_select.find_all(exp.Join):
+            join_source = join.this
+            if isinstance(join_source, exp.Table):
+                table_name = join_source.name.upper() if join_source.name else ""
+                alias = (join_source.alias or join_source.name)
+                if alias and table_name:
+                    alias_upper = alias.upper()
+                    if alias_upper not in scope.relations:
+                        cte_scope = _find_cte_in_scope_chain(table_name, scope)
+                        if cte_scope is not None:
+                            scope.relations[alias_upper] = cte_scope
+                        else:
+                            scope.relations[alias_upper] = table_name
+                        logger.debug(f"FIX 22: Registered table from EXISTS JOIN: {alias_upper} -> {table_name}")
 
 
 def _register_unpivot_columns(select_expr: exp.Select, scope: Scope) -> None:
