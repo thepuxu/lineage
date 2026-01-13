@@ -907,12 +907,39 @@ def build_scope_tree(ast: exp.Expression, name: str = "ROOT", parent: Optional[S
                 cte_scope = build_scope_tree(cte.this, f"{name}/CTE_{cte_name}", scope, dm_dict)
                 scope.ctes[cte_name] = cte_scope
 
+    # FIX 21: Helper to qualify column refs with source table
+    def _qualify_column_ref(col_ref: str, branch: Scope) -> str:
+        """
+        Qualify an unqualified column ref with its source table from the branch.
+        If col_ref already has a dot (table.col), return as-is.
+        Otherwise, find the source table from branch.relations.
+        """
+        col_ref = col_ref.strip()
+
+        # Already qualified with table
+        if '.' in col_ref:
+            return col_ref
+
+        # Try to find the source table from branch's relations
+        for alias, rel in branch.relations.items():
+            if isinstance(rel, str):
+                # rel is a physical table name - qualify with it
+                return f"{rel}.{col_ref}"
+            elif isinstance(rel, Scope):
+                # rel is a subquery - check if column exists in its projections
+                if col_ref.upper() in rel.projections:
+                    return f"{alias}.{col_ref}"
+
+        # Fallback: return unqualified (resolution will handle later)
+        return col_ref
+
     # FIX 20: Merge UNION branch projections by position
     def _merge_union_projections(union_scope: Scope) -> None:
         """
         Merge lineage across UNION branches by column position.
         - Column names follow the first branch (SQL behavior).
         - Lineage (source_refs) is the union of all branches for each position.
+        - FIX 21: Each source is qualified with its branch's source table.
         """
         if not union_scope.union_branches:
             return
@@ -924,23 +951,26 @@ def build_scope_tree(ast: exp.Expression, name: str = "ROOT", parent: Optional[S
         first_items = list(first.projections.items())
 
         for idx, (col_name, base_proj) in enumerate(first_items):
-            # Start with first branch's source refs
             combined_sources: List[str] = []
-            if base_proj.source_refs:
-                combined_sources.extend(base_proj.source_refs)
-            else:
-                combined_sources.append(base_proj.expression)
+
+            # FIX 21: Qualify first branch's source refs with their source table
+            first_sources = base_proj.source_refs or [base_proj.expression]
+            for src in first_sources:
+                qualified = _qualify_column_ref(src, first)
+                if qualified not in combined_sources:
+                    combined_sources.append(qualified)
 
             # Walk other branches and merge lineage at same position
             for branch in union_scope.union_branches[1:]:
                 branch_items = list(branch.projections.items())
                 if idx < len(branch_items):
                     _, branch_proj = branch_items[idx]
-                    # Get this branch's source refs
+                    # FIX 21: Qualify this branch's source refs with their source table
                     branch_sources = branch_proj.source_refs or [branch_proj.expression]
                     for src in branch_sources:
-                        if src not in combined_sources:
-                            combined_sources.append(src)
+                        qualified = _qualify_column_ref(src, branch)
+                        if qualified not in combined_sources:
+                            combined_sources.append(qualified)
 
             # Create merged projection (name from first branch, all sources accumulated)
             merged[col_name.upper()] = ProjectionDef(
@@ -1803,7 +1833,8 @@ def resolve_to_physical(
                         return []  # Not found in nested scopes either
 
                     proj = current_scope.projections[col.upper()]
-                    refs = extract_column_refs(proj.expression)
+                    # FIX 21: Use source_refs when populated (from UNION merge) instead of expression
+                    refs = proj.source_refs if proj.source_refs else extract_column_refs(proj.expression)
 
                     # FIX 16: Check if expression is a constant (no column refs)
                     if not refs:
