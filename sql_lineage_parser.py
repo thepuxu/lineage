@@ -2398,6 +2398,60 @@ def _resolve_join_field(
     return results
 
 
+def _filter_non_column_refs(
+    refs: List[str],
+    dm_dict: Dict[str, Set[str]],
+    scope: Scope
+) -> List[str]:
+    """
+    FIX 19: Filter out tokens that are not actual column references.
+
+    Removes:
+    - schema.table patterns (e.g., ATOMIC.STG_DES3_DEFAULT_CASH_FLOW_SCD)
+    - Bare table names (e.g., STG_CARDS)
+    - Bare aliases (e.g., SC) that are subquery aliases, not columns
+    """
+    all_tables = {t.upper() for t in dm_dict.keys()} if dm_dict else set()
+
+    # Common schema names - these are NOT aliases
+    known_schemas = {'ATOMIC', 'DBO', 'PUBLIC', 'SYS', 'SCHEMA', 'ADMIN', 'APP'}
+
+    # Collect all aliases in current scope (subquery aliases, table aliases)
+    scope_aliases = {a.upper() for a in scope.relations.keys()} if scope else set()
+
+    filtered = []
+    for ref in refs:
+        ref_upper = ref.upper()
+
+        if '.' in ref:
+            left, right = ref.split('.', 1)
+            left_upper, right_upper = left.upper(), right.upper()
+
+            # Skip if left is a known schema and right is a table name
+            if left_upper in known_schemas and right_upper in all_tables:
+                logger.debug(f"[FIX19] Skipping schema.table: {ref}")
+                continue
+
+            # Skip if right side is a known table name (likely schema.table pattern)
+            if right_upper in all_tables and left_upper not in scope_aliases:
+                logger.debug(f"[FIX19] Skipping schema.table (right is table): {ref}")
+                continue
+        else:
+            # Bare token - skip if it's a known table name
+            if ref_upper in all_tables:
+                logger.debug(f"[FIX19] Skipping bare table name: {ref}")
+                continue
+
+            # Skip if it's a known alias in current scope (not a column)
+            if ref_upper in scope_aliases:
+                logger.debug(f"[FIX19] Skipping bare alias: {ref}")
+                continue
+
+        filtered.append(ref)
+
+    return filtered
+
+
 def _resolve_join_filters(
     filters: str,
     scope: Scope,
@@ -2412,6 +2466,9 @@ def _resolve_join_filters(
 
     # Extract column refs from filter string (may contain multiple conditions)
     refs = extract_column_refs(filters)
+
+    # FIX 19: Filter out non-column tokens (schema.table, bare aliases, table names)
+    refs = _filter_non_column_refs(refs, dm_dict, scope)
 
     for ref in refs:
         original_alias, original_field = parse_ref(ref)
