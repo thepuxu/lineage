@@ -176,6 +176,7 @@ class ProjectionDef:
     output_name: str
     expression: str
     source_refs: List[str] = field(default_factory=list)
+    origin_alias: Optional[str] = None  # Which alias.* expansion this projection came from
 
 
 @dataclass
@@ -973,12 +974,25 @@ def build_scope_tree(ast: exp.Expression, name: str = "ROOT", parent: Optional[S
             else:
                 expr_node = item
             expr_sql = expr_node.sql(dialect="oracle")
+
+            # Extract origin_alias from qualified column expression
+            # This helps identity case prioritize the right source when descending through scopes
+            refs = extract_column_refs(expr_sql)
+            origin_alias = None
+            if len(refs) == 1:
+                ref_alias, ref_col = parse_ref(refs[0])
+                if ref_alias:
+                    origin_alias = ref_alias  # e.g., "SLC" for SLC.FIC_MIS_DATE
+
             scope.projections[output_name.upper()] = ProjectionDef(
                 output_name=output_name,
                 expression=expr_sql,
-                source_refs=extract_column_refs(expr_sql)
+                source_refs=refs,
+                origin_alias=origin_alias
             )
+            logger.debug(f"[PROJ_REG] {scope.name}: {output_name.upper()} = {expr_sql[:60]}...")
 
+    logger.debug(f"[SCOPE_BUILT] {scope.name} with {len(scope.projections)} projections, {len(scope.relations)} relations")
     return scope
 
 
@@ -991,14 +1005,14 @@ def _expand_star_projection(scope: Scope, dm_dict: Optional[Dict[str, Set[str]]]
     # Check relations (FROM/JOIN sources)
     for alias, relation in scope.relations.items():
         if isinstance(relation, Scope):
-            # CTE or subquery - copy its projections with qualified names
+            # CTE or subquery - copy inner projection's expression directly
+            # This avoids creating ALIAS.COLUMN refs that cause cycle detection issues
             for proj_name, proj_def in relation.projections.items():
-                # Create qualified reference to the source
-                qualified_expr = f"{alias}.{proj_name}"
                 scope.projections[proj_name.upper()] = ProjectionDef(
                     output_name=proj_name,
-                    expression=qualified_expr,
-                    source_refs=[qualified_expr]
+                    expression=proj_def.expression,
+                    source_refs=proj_def.source_refs.copy() if proj_def.source_refs else [proj_def.expression],
+                    origin_alias=alias  # Track which alias.* this came from
                 )
         elif isinstance(relation, str):
             # Physical table - expand from DM if available
@@ -1050,28 +1064,40 @@ def _expand_qualified_star(scope: Scope, alias: str, dm_dict: Optional[Dict[str,
     For physical tables: expand ALL columns from DM if available
     Also searches nested scopes if alias not found directly.
     """
+    logger.debug(f"[STAR_EXPAND] Called for alias={alias} in scope={scope.name}")
+
     # First try direct relations, then search nested scopes
     if alias in scope.relations:
         relation = scope.relations[alias]
+        logger.debug(f"[STAR_EXPAND] Found {alias} in direct relations")
     else:
         # Search in nested scopes (handles interia1.* when interia1 is deeply nested)
         relation = _find_scope_by_alias(scope, alias)
         if relation is None:
+            logger.debug(f"[STAR_EXPAND] Alias {alias} NOT FOUND anywhere!")
             return  # Alias not found anywhere
+        logger.debug(f"[STAR_EXPAND] Found {alias} in nested scopes")
 
     if isinstance(relation, Scope):
-        # CTE or subquery - copy its projections with qualified names
+        # CTE or subquery - copy inner projection's expression directly
+        # This avoids creating ALIAS.COLUMN refs that cause cycle detection issues
+        logger.debug(f"[STAR_EXPAND] {alias} is Scope with {len(relation.projections)} projections")
+        for pname in list(relation.projections.keys())[:10]:
+            expr = relation.projections[pname].expression[:60] if relation.projections[pname].expression else "None"
+            logger.debug(f"[STAR_EXPAND]   - {pname}: {expr}")
+        if len(relation.projections) > 10:
+            logger.debug(f"[STAR_EXPAND]   ... and {len(relation.projections) - 10} more")
         for proj_name, proj_def in relation.projections.items():
-            # Create qualified reference to the source
-            qualified_expr = f"{alias}.{proj_name}"
             scope.projections[proj_name.upper()] = ProjectionDef(
                 output_name=proj_name,
-                expression=qualified_expr,
-                source_refs=[qualified_expr]
+                expression=proj_def.expression,
+                source_refs=proj_def.source_refs.copy() if proj_def.source_refs else [proj_def.expression],
+                origin_alias=alias  # Track which alias.* this came from
             )
     elif isinstance(relation, str):
         # Physical table - expand from DM if available
         table_name = relation.upper()
+        logger.debug(f"[STAR_EXPAND] {alias} is physical table: {table_name}")
         if dm_dict and table_name in dm_dict:
             # Expand to ALL columns from DM
             for col_name in dm_dict[table_name]:
@@ -1251,10 +1277,28 @@ def find_relation_in_scope_chain(alias: str, scope: Scope) -> Optional[Union[str
     if alias in scope.ctes:
         return scope.ctes[alias]
 
-    # Search nested scopes (handles cases like interia1.* when interia1 is deeply nested)
+    # Search nested scopes for SCOPE alias (handles cases like interia1.* when interia1 is deeply nested)
     nested = _find_scope_by_alias(scope, alias)
     if nested:
         return nested
+
+    # Search nested scopes for PHYSICAL TABLE alias
+    # This handles cases where star expansion copied expressions with inner-scope table aliases
+    # e.g., outer scope has projection "SLC.FIC_MIS_DATE" but SLC is only defined in inner scope
+    def find_physical_in_nested(s: Scope, tbl_alias: str) -> Optional[str]:
+        """Recursively search for physical table alias in nested scopes."""
+        for rel_alias, rel in s.relations.items():
+            if rel_alias == tbl_alias and isinstance(rel, str):
+                return rel  # Found physical table
+            if isinstance(rel, Scope):
+                found = find_physical_in_nested(rel, tbl_alias)
+                if found:
+                    return found
+        return None
+
+    physical = find_physical_in_nested(scope, alias)
+    if physical:
+        return physical
 
     # Walk up to parent
     if scope.parent:
@@ -1394,20 +1438,10 @@ def resolve_to_physical(
 
         # Subquery scope
         if isinstance(relation, Scope):
-            # SELF-REFERENCE CHECK: If the found Scope is the same as (or parent of) current scope,
-            # we have a self-referential situation (e.g., DESJ_RAY_RETAIL_EXPO.COL inside scope DESJ_RAY_RETAIL_EXPO)
-            # In this case, look for a physical table with the same name inside the current scope instead
-            is_self_reference = (relation is scope) or (relation.name == scope.name)
-            if not is_self_reference:
-                # Also check if we're resolving within the scope that's aliased as this alias in parent
-                # Walk up and check if parent has this alias pointing to current scope
-                check_scope = scope
-                while check_scope and not is_self_reference:
-                    if check_scope.parent and alias.upper() in check_scope.parent.relations:
-                        parent_rel = check_scope.parent.relations[alias.upper()]
-                        if isinstance(parent_rel, Scope) and parent_rel is check_scope:
-                            is_self_reference = True
-                    check_scope = check_scope.parent
+            # SELF-REFERENCE CHECK: Only trigger when relation IS the same scope object
+            # (e.g., resolving ALIAS.COL where ALIAS points to the current scope we're in)
+            # Don't trigger for normal parent→child alias mapping (that's valid subquery descent)
+            is_self_reference = (relation is scope)
 
             if is_self_reference:
                 # Look for physical table with same name inside current scope or its nested scopes
@@ -1459,9 +1493,9 @@ def resolve_to_physical(
                     column=f"{alias}.{column}"
                 )]
 
-            # CTE scopes get fresh visited set to avoid false cycle detection
-            if "CTE_" in relation.name:
-                visited = set()
+            # All subquery scopes get fresh visited set to avoid false cycle detection
+            # (not just CTEs - any child scope should reset to avoid ping-pong cycles)
+            visited = set()
 
             # Handle UNION scopes - resolve from ALL branches
             if relation.union_branches:
@@ -1497,30 +1531,28 @@ def resolve_to_physical(
 
             # Column not found in scope projections - try searching nested scopes
             # This handles cases where star expansion didn't propagate all columns
-            nested_scope = _find_scope_by_alias(relation, column.upper())
-            if nested_scope is None:
-                # Also try finding the column in any nested scope's projections
-                def find_column_in_nested(s: Scope, col: str) -> Optional[Scope]:
-                    if col.upper() in s.projections:
-                        return s
-                    for _, rel in s.relations.items():
-                        if isinstance(rel, Scope):
-                            found = find_column_in_nested(rel, col)
-                            if found:
-                                return found
-                    return None
+            # (Removed misuse of _find_scope_by_alias with column name - it expects alias)
+            def find_column_in_nested(s: Scope, col: str) -> Optional[Scope]:
+                if col.upper() in s.projections:
+                    return s
+                for _, rel in s.relations.items():
+                    if isinstance(rel, Scope):
+                        found = find_column_in_nested(rel, col)
+                        if found:
+                            return found
+                return None
 
-                nested_with_col = find_column_in_nested(relation, column)
-                if nested_with_col:
-                    proj = nested_with_col.projections[column.upper()]
-                    return resolve_expression(
-                        proj.expression,
-                        nested_with_col,
-                        dm_dict,
-                        visited.copy(),
-                        trace + [nested_with_col.name],
-                        max_depth
-                    )
+            nested_with_col = find_column_in_nested(relation, column)
+            if nested_with_col:
+                proj = nested_with_col.projections[column.upper()]
+                return resolve_expression(
+                    proj.expression,
+                    nested_with_col,
+                    dm_dict,
+                    visited.copy(),
+                    trace + [nested_with_col.name],
+                    max_depth
+                )
 
             # Column truly not found
             debug_info = _generate_debug_info(column, relation if isinstance(relation, Scope) else scope, "MISSING_PROJECTION", alias)
@@ -1570,8 +1602,20 @@ def resolve_to_physical(
         # First check projections in current scope
         if column.upper() in scope.projections:
             proj = scope.projections[column.upper()]
-            # Prevent identity loop
-            if normalize_identifier(proj.expression) != column.upper():
+            # Prevent identity loop - check both unqualified AND qualified identity
+            # e.g., D_END_OF_PERIOD → D_END_OF_PERIOD (unqualified)
+            # e.g., D_END_OF_PERIOD → ALIAS.D_END_OF_PERIOD (qualified identity)
+            expr_refs = extract_column_refs(proj.expression)
+            is_identity = False
+            if normalize_identifier(proj.expression) == column.upper():
+                is_identity = True  # Unqualified identity
+            elif len(expr_refs) == 1:
+                # Check if it's a qualified reference to the same column
+                ref_alias, ref_col = parse_ref(expr_refs[0])
+                if ref_col.upper() == column.upper():
+                    is_identity = True  # Qualified identity (e.g., ALIAS.SAME_COL)
+
+            if not is_identity:
                 return resolve_expression(
                     proj.expression,
                     scope,
@@ -1580,6 +1624,96 @@ def resolve_to_physical(
                     trace,
                     max_depth
                 )
+            else:
+                # IDENTITY CASE: Prefer child scope (origin_alias) FIRST, then parent physical tables
+                # This prevents wrong mapping when parent has same-named column from different table
+                phys_candidates: List[ResolvedColumn] = []
+
+                # Get the origin alias if this projection came from alias.* expansion
+                origin = proj.origin_alias.upper() if proj.origin_alias else None
+
+                # Build ordered list of child scopes to check (origin first)
+                child_scopes_to_check: List[tuple] = []
+                for alias_name, relation in scope.relations.items():
+                    if isinstance(relation, Scope):
+                        if origin and alias_name.upper() == origin:
+                            child_scopes_to_check.insert(0, (alias_name, relation))  # Origin at front
+                        else:
+                            child_scopes_to_check.append((alias_name, relation))
+
+                # STEP 1: Check child scopes (origin first) for the true physical source
+                # Use recursive helper to traverse multiple nested layers
+                def trace_to_physical(current_scope: Scope, col: str, path: List[str], depth: int = 0) -> List[ResolvedColumn]:
+                    """Recursively trace through nested scopes to find physical source."""
+                    if depth > 10:  # Prevent infinite loops
+                        return []
+                    results: List[ResolvedColumn] = []
+
+                    # If column not in projections, search nested scopes
+                    if col.upper() not in current_scope.projections:
+                        # Search child scopes for the column
+                        for child_alias, child_rel in current_scope.relations.items():
+                            if isinstance(child_rel, Scope) and col.upper() in child_rel.projections:
+                                deeper = trace_to_physical(child_rel, col, path + [child_rel.name], depth + 1)
+                                if deeper:
+                                    return deeper
+                        return []  # Not found in nested scopes either
+
+                    proj = current_scope.projections[col.upper()]
+                    refs = extract_column_refs(proj.expression)
+
+                    for r in refs:
+                        ref_alias, ref_col = parse_ref(r)
+                        if ref_alias:
+                            rel = find_relation_in_scope_chain(ref_alias, current_scope)
+                            if isinstance(rel, str):  # Physical table found!
+                                dm = "Y" if column_exists_in_dm(rel, ref_col, dm_dict) else "N"
+                                results.append(ResolvedColumn(
+                                    source_type=SourceType.PHYSICAL,
+                                    table=rel,
+                                    column=ref_col,
+                                    dm_match=dm,
+                                    trace_path="->".join(path) + f":{rel}.{ref_col}"
+                                ))
+                            elif isinstance(rel, Scope):  # Another nested scope - drill deeper
+                                deeper = trace_to_physical(rel, ref_col, path + [rel.name], depth + 1)
+                                results.extend(deeper)
+                        else:
+                            # Unqualified ref - check all relations in current scope
+                            for child_alias, child_rel in current_scope.relations.items():
+                                if isinstance(child_rel, str):
+                                    dm = "Y" if column_exists_in_dm(child_rel, ref_col, dm_dict) else "N"
+                                    results.append(ResolvedColumn(
+                                        source_type=SourceType.PHYSICAL,
+                                        table=child_rel,
+                                        column=ref_col,
+                                        dm_match=dm,
+                                        trace_path="->".join(path) + f":{child_rel}.{ref_col}"
+                                    ))
+                                elif isinstance(child_rel, Scope) and ref_col.upper() in child_rel.projections:
+                                    deeper = trace_to_physical(child_rel, ref_col, path + [child_rel.name], depth + 1)
+                                    results.extend(deeper)
+
+                    return results
+
+                for alias_name, relation in child_scopes_to_check:
+                    if column.upper() in relation.projections:
+                        phys_candidates = trace_to_physical(relation, column, trace + [relation.name])
+                        if phys_candidates:
+                            return phys_candidates  # Found physical source - return immediately
+
+                # REMOVED: Fallback to parent physical tables was picking wrong tables from JOINs
+                # (e.g., DESJ_CTR_MAPPING instead of STG_LOAN_CONTRACTS)
+                # Instead, if child scopes had nothing, return UNRESOLVED for debuggability
+
+                # No child scope source found for identity column
+                debug_info = _generate_debug_info(column, scope, "COLUMN_NOT_FOUND (identity passthrough)")
+                return [ResolvedColumn(
+                    source_type=SourceType.UNRESOLVED,
+                    reason=f"{UnresolvedReason.COLUMN_NOT_FOUND.value} | {debug_info}",
+                    trace_path="->".join(trace),
+                    column=column
+                )]
 
         # Find in visible relations (physical tables AND CTE/subquery scopes)
         candidates: List[ResolvedColumn] = []
