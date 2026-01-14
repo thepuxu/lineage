@@ -134,10 +134,10 @@ REQUIRED_DM_COLUMNS = ['Table Physical Name', 'Column Physical Name']
 # Output column definitions
 MAPPING_COLUMNS = [
     'sql_file', 'object_name', 'row_type', 'dest_table', 'dest_field', 'source_type',
-    'source_table', 'source_field', 'constant_value', 'expression',
-    'dm_match', 'trace_path', 'notes',
-    # FIX 24: Expression context columns
+    'source_table', 'source_field',
+    # FIX 24: Expression context columns (after source_field)
     'source_alias', 'original_ref', 'full_expression',
+    'constant_value', 'expression', 'dm_match', 'trace_path', 'notes',
     # Join-specific columns (empty for MAPPING rows)
     'table_alias', 'join_seq', 'join_type', 'join_side', 'field_role',
     'join_condition', 'context_path'
