@@ -973,7 +973,8 @@ def build_scope_tree(ast: exp.Expression, name: str = "ROOT", parent: Optional[S
             combined_sources: List[str] = []
 
             # FIX 21: Qualify first branch's source refs with their source table
-            first_sources = base_proj.source_refs or [base_proj.expression]
+            # FIX 25: Don't fall back to expression - that reintroduces subquery text as a "source"
+            first_sources = base_proj.source_refs  # Only real column tokens
             for src in first_sources:
                 qualified = _qualify_column_ref(src, first)
                 if qualified not in combined_sources:
@@ -985,7 +986,8 @@ def build_scope_tree(ast: exp.Expression, name: str = "ROOT", parent: Optional[S
                 if idx < len(branch_items):
                     _, branch_proj = branch_items[idx]
                     # FIX 21: Qualify this branch's source refs with their source table
-                    branch_sources = branch_proj.source_refs or [branch_proj.expression]
+                    # FIX 25: Don't fall back to expression - that reintroduces subquery text as a "source"
+                    branch_sources = branch_proj.source_refs  # Only real column tokens
                     for src in branch_sources:
                         qualified = _qualify_column_ref(src, branch)
                         if qualified not in combined_sources:
@@ -1081,10 +1083,18 @@ def build_scope_tree(ast: exp.Expression, name: str = "ROOT", parent: Optional[S
                 expr_node = item
             expr_sql = expr_node.sql(dialect="oracle")
 
-            # Extract origin_alias from qualified column expression
-            # This helps identity case prioritize the right source when descending through scopes
-            refs = extract_column_refs(expr_sql)
-            origin_alias = None
+            # FIX 25: For scalar subqueries, don't extract source_refs from inside the subquery
+            # Those tokens would incorrectly get qualified with the branch's physical tables
+            # Let resolve_expression() handle the subquery properly later
+            subquery_pattern = r'\(\s*SELECT\b'
+            if re.search(subquery_pattern, expr_sql, re.IGNORECASE):
+                refs = []  # Don't extract tokens from scalar subquery
+                origin_alias = None
+            else:
+                # Extract origin_alias from qualified column expression
+                # This helps identity case prioritize the right source when descending through scopes
+                refs = extract_column_refs(expr_sql)
+                origin_alias = None
             if len(refs) == 1:
                 ref_alias, ref_col = parse_ref(refs[0])
                 if ref_alias:
