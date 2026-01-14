@@ -136,6 +136,8 @@ MAPPING_COLUMNS = [
     'sql_file', 'object_name', 'row_type', 'dest_table', 'dest_field', 'source_type',
     'source_table', 'source_field', 'constant_value', 'expression',
     'dm_match', 'trace_path', 'notes',
+    # FIX 24: Expression context columns
+    'source_alias', 'original_ref', 'full_expression',
     # Join-specific columns (empty for MAPPING rows)
     'table_alias', 'join_seq', 'join_type', 'join_side', 'field_role',
     'join_condition', 'context_path'
@@ -150,7 +152,9 @@ JOIN_KEYS_EXPLODED_COLUMNS = [
     'sql_file', 'object_name', 'join_seq', 'join_type', 'join_side',
     'field_role', 'original_alias', 'original_field', 'source_type',
     'physical_table', 'physical_field', 'constant_value', 'dm_match',
-    'trace_path', 'unresolved_reason', 'join_condition', 'context_path'
+    'trace_path', 'unresolved_reason', 'join_condition', 'context_path',
+    # FIX 24: Full expression context for join keys
+    'full_expression'
 ]
 
 # MAPPING_JOIN_RELATION_COLUMNS removed - joins now merged into MAPPING_COLUMNS
@@ -201,6 +205,10 @@ class ResolvedColumn:
     trace_path: str = ""
     reason: str = ""
     dm_match: str = "N"
+    # FIX 24: Expression context fields
+    source_alias: str = ""      # Original alias (e.g., "t" from "some_table t")
+    original_ref: str = ""      # Original reference (e.g., "t.column_a")
+    full_expression: str = ""   # Full expression context (e.g., "COALESCE(t.col, 0)")
 
 
 @dataclass
@@ -238,6 +246,8 @@ class JoinKeyExploded:
     unresolved_reason: str = ""
     join_condition: str = ""
     context_path: str = ""
+    # FIX 24: Full expression context
+    full_expression: str = ""    # The complete expression (for complex filters)
 
 
 @dataclass
@@ -252,10 +262,14 @@ class LineageEdge:
     source_table: str = ""
     source_field: str = ""
     constant_value: str = ""
-    expression: str = ""
+    expression: str = ""  # Full expression context (e.g., "COALESCE(t.col, 0)")
     dm_match: str = ""
     trace_path: str = ""
     notes: str = ""
+    # FIX 24: Expression context fields
+    source_alias: str = ""      # Original alias used (e.g., "t" from "some_table t")
+    original_ref: str = ""      # Original reference as written (e.g., "t.column_a")
+    full_expression: str = ""   # Full SQL expression containing the column (e.g., "COALESCE(t.col, 0)")
     # Join-specific fields (empty for MAPPING rows)
     table_alias: str = ""
     join_seq: str = ""  # String to allow empty for mappings
@@ -1621,7 +1635,10 @@ def resolve_to_physical(
                 table=relation,
                 column=column,
                 dm_match=dm_match,
-                trace_path="->".join(trace) + f":{relation}.{column}"
+                trace_path="->".join(trace) + f":{relation}.{column}",
+                # FIX 24: Capture original alias and reference
+                source_alias=alias,
+                original_ref=ref
             )]
 
         # Subquery scope
@@ -1941,7 +1958,10 @@ def resolve_to_physical(
                                     table=rel,
                                     column=ref_col,
                                     dm_match=dm,
-                                    trace_path="->".join(path) + f":{rel}.{ref_col}"
+                                    trace_path="->".join(path) + f":{rel}.{ref_col}",
+                                    # FIX 24: Capture original alias and reference
+                                    source_alias=ref_alias,
+                                    original_ref=r
                                 ))
                             elif isinstance(rel, Scope):  # Another nested scope - drill deeper
                                 deeper = trace_to_physical(rel, ref_col, path + [rel.name], depth + 1)
@@ -1958,7 +1978,10 @@ def resolve_to_physical(
                                         table=child_rel,
                                         column=ref_col,
                                         dm_match=dm,
-                                        trace_path="->".join(path) + f":{child_rel}.{ref_col}"
+                                        trace_path="->".join(path) + f":{child_rel}.{ref_col}",
+                                        # FIX 24: Capture alias (inferred) and reference
+                                        source_alias=child_alias,
+                                        original_ref=ref_col  # Unqualified - just column name
                                     ))
                                 elif isinstance(child_rel, Scope) and ref_col.upper() in child_rel.projections:
                                     deeper = trace_to_physical(child_rel, ref_col, path + [child_rel.name], depth + 1)
@@ -1991,7 +2014,10 @@ def resolve_to_physical(
                                 table=relation,
                                 column=column,
                                 dm_match=dm,
-                                trace_path="->".join(trace) + f":{relation}.{column}"
+                                trace_path="->".join(trace) + f":{relation}.{column}",
+                                # FIX 24: Capture alias and reference (identity case)
+                                source_alias=alias_name,
+                                original_ref=column  # Unqualified identity reference
                             ))
                     if physical_results:
                         return physical_results
@@ -2550,7 +2576,9 @@ def _resolve_join_field(
             trace_path=resolved.trace_path,
             unresolved_reason=resolved.reason if resolved.source_type == SourceType.UNRESOLVED else "",
             join_condition=join.join_condition,
-            context_path=join.context_path
+            context_path=join.context_path,
+            # FIX 24: Full expression is the join condition
+            full_expression=join.join_condition
         )
         results.append(exploded)
 
@@ -2653,7 +2681,9 @@ def _resolve_join_filters(
                 trace_path=resolved.trace_path,
                 unresolved_reason=resolved.reason if resolved.source_type == SourceType.UNRESOLVED else "",
                 join_condition=filters,
-                context_path=join.context_path
+                context_path=join.context_path,
+                # FIX 24: Full expression is the filter expression
+                full_expression=filters
             )
             results.append(exploded)
 
@@ -2699,6 +2729,10 @@ def build_mapping_df(result: LineageResult) -> pd.DataFrame:
             'dm_match': edge.dm_match,
             'trace_path': edge.trace_path,
             'notes': edge.notes,
+            # FIX 24: Expression context columns
+            'source_alias': edge.source_alias,
+            'original_ref': edge.original_ref,
+            'full_expression': edge.full_expression,
             # Join-specific columns
             'table_alias': edge.table_alias,
             'join_seq': edge.join_seq,
@@ -2763,7 +2797,9 @@ def build_join_keys_exploded_df(result: LineageResult) -> pd.DataFrame:
             'trace_path': jke.trace_path,
             'unresolved_reason': jke.unresolved_reason,
             'join_condition': jke.join_condition,
-            'context_path': jke.context_path
+            'context_path': jke.context_path,
+            # FIX 24: Full expression context
+            'full_expression': jke.full_expression
         })
 
     df = pd.DataFrame(rows, columns=JOIN_KEYS_EXPLODED_COLUMNS)
@@ -3027,6 +3063,8 @@ def create_direct_mapping_edge(
     # Check DM match
     dm_match = 'Y' if column_exists_in_dm(source_table, source_column, dm_dict) else 'N'
 
+    # FIX 24: Build original reference (no alias for direct mappings)
+    orig_ref = f'{source_table}.{source_column}'
     return LineageEdge(
         sql_file=sql_file,
         object_name=object_name,
@@ -3036,10 +3074,14 @@ def create_direct_mapping_edge(
         source_table=source_table,
         source_field=source_column,
         constant_value='',
-        expression=f'{source_table}.{source_column}',
+        expression=orig_ref,
         dm_match=dm_match,
         trace_path='DIRECT_MAPPING',
-        notes='Direct mapping from Source Table/Column (no Expression)'
+        notes='Direct mapping from Source Table/Column (no Expression)',
+        # FIX 24: Expression context (no alias for direct mappings)
+        source_alias='',
+        original_ref=orig_ref,
+        full_expression=orig_ref
     )
 
 
@@ -3141,7 +3183,11 @@ def process_sql_file(
                         expression=expr,
                         dm_match=resolved.dm_match,
                         trace_path=resolved.trace_path,
-                        notes=resolved.reason
+                        notes=resolved.reason,
+                        # FIX 24: Expression context
+                        source_alias=resolved.source_alias,
+                        original_ref=resolved.original_ref,
+                        full_expression=resolved.full_expression or expr  # Use resolved if available, else doc-support expr
                     )
                     result.edges.append(edge)
         else:
@@ -3171,7 +3217,11 @@ def process_sql_file(
                     expression=expr,
                     dm_match=resolved.dm_match,
                     trace_path=resolved.trace_path,
-                    notes=resolved.reason
+                    notes=resolved.reason,
+                    # FIX 24: Expression context
+                    source_alias=resolved.source_alias,
+                    original_ref=resolved.original_ref,
+                    full_expression=resolved.full_expression or expr  # Use resolved if available, else doc-support expr
                 )
                 result.edges.append(edge)
 
@@ -3197,6 +3247,8 @@ def process_sql_file(
 
     # Convert JoinKeyExploded to LineageEdge and append to edges (merged output)
     for jke in result.joins_exploded:
+        # FIX 24: Build original_ref from alias and field
+        orig_ref = f"{jke.original_alias}.{jke.original_field}" if jke.original_alias else jke.original_field
         join_edge = LineageEdge(
             sql_file=jke.sql_file,
             object_name=jke.object_name,
@@ -3207,10 +3259,15 @@ def process_sql_file(
             source_table=jke.physical_table,
             source_field=jke.physical_field,
             constant_value=jke.constant_value,
-            expression=f"{jke.original_alias}.{jke.original_field}" if jke.original_alias else jke.original_field,
+            expression=orig_ref,
             dm_match=jke.dm_match,
             trace_path=jke.trace_path,
             notes=jke.unresolved_reason,
+            # FIX 24: Expression context
+            source_alias=jke.original_alias,
+            original_ref=orig_ref,
+            full_expression=jke.full_expression,
+            # Join-specific fields
             table_alias=jke.original_alias,
             join_seq=str(jke.join_seq) if jke.join_seq else "",
             join_type=jke.join_type,
