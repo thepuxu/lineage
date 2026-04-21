@@ -560,6 +560,51 @@ def load_sql_directory(dir_path: Path) -> List[Path]:
     return sorted(sql_files)
 
 
+def parse_bulk_txt(txt_path: Path) -> List[Tuple[str, str]]:
+    """Parse a bulk .txt file containing multiple SQL queries.
+
+    Queries are separated by empty lines. Each query contains a
+    /*T2T_OBJECT_NAME*/ comment that identifies the object.
+
+    Args:
+        txt_path: Path to the bulk .txt file.
+
+    Returns:
+        List of (object_name, sql_content) tuples.
+    """
+    if not txt_path.exists():
+        logger.error(f"Bulk SQL text file not found: {txt_path}")
+        sys.exit(3)
+
+    content = read_file_with_retry(txt_path)
+
+    # Split on one or more blank lines
+    chunks = re.split(r'\n\s*\n', content.strip())
+
+    results = []
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+
+        # Extract object name from /*...*/ comment
+        match = re.search(r'/\*\s*(.*?)\s*\*/', chunk)
+        if match:
+            object_name = match.group(1).strip().upper()
+        else:
+            object_name = f"UNKNOWN_{len(results) + 1}"
+            logger.warning(f"No /*...*/ comment found in query chunk, using {object_name}")
+
+        results.append((object_name, chunk))
+
+    if not results:
+        logger.error(f"No SQL queries found in: {txt_path}")
+        sys.exit(3)
+
+    logger.info(f"Parsed {len(results)} queries from {txt_path}")
+    return results
+
+
 def validate_sql_content(sql: str, filepath: Path) -> Tuple[bool, str, List[str]]:
     """Validate SQL content before parsing."""
     warnings: List[str] = []
@@ -3305,36 +3350,33 @@ def extract_insert_assignments(target_columns: list, scope: Scope) -> list:
     return assignments
 
 
-def process_sql_file(
-    sql_path: Path,
+def _process_sql_core(
+    sql_content: str,
+    object_name: str,
     dm_dict: Dict[str, Set[str]],
     output_dir: Optional[Path] = None,
     max_depth: int = 50,
-    sql_file_name: str = ""
+    sql_file_name: str = "",
+    source_label: str = ""
 ) -> Optional[Union[Path, LineageResult]]:
-    """Process a single SQL file (MERGE INTO or INSERT INTO SELECT).
-
-    Extracts column-level physical data lineage from SQL DML statements.
+    """Core SQL processing logic shared by file-based and text-based entry points.
 
     Args:
-        sql_path: Path to SQL file containing MERGE INTO or INSERT INTO statement.
+        sql_content: Raw SQL text to process.
+        object_name: Object name for output labeling.
         dm_dict: Data model dictionary (may be empty).
         output_dir: Output directory. If None, returns LineageResult.
         max_depth: Maximum resolution depth.
-        sql_file_name: SQL filename for output. Defaults to sql_path.stem.
-
-    Returns:
-        Path to output file if output_dir provided, LineageResult if output_dir is None.
+        sql_file_name: SQL filename for output columns.
+        source_label: Label for error messages (e.g. file path or object name).
     """
-    object_name, sql_content = load_sql_file(sql_path)
-
-    if not sql_file_name:
-        sql_file_name = sql_path.stem
+    if not source_label:
+        source_label = object_name
 
     # Validate SQL
-    valid, sql_clean, warnings = validate_sql_content(sql_content, sql_path)
+    valid, sql_clean, warnings = validate_sql_content(sql_content, source_label)
     if not valid:
-        logger.error(f"Invalid SQL in {sql_path}: {sql_clean}")
+        logger.error(f"Invalid SQL in {source_label}: {sql_clean}")
         return None
 
     sql_normalized = normalize_sql(sql_clean)
@@ -3343,7 +3385,7 @@ def process_sql_file(
     try:
         ast = sqlglot.parse_one(sql_normalized, dialect="oracle")
     except Exception as e:
-        logger.error(f"SQL parse error in {sql_path}: {e}")
+        logger.error(f"SQL parse error in {source_label}: {e}")
         diagnostics = diagnose_sql_issues(sql_normalized)
         if diagnostics:
             for diag in diagnostics:
@@ -3360,7 +3402,7 @@ def process_sql_file(
         try:
             merge_info = parse_merge_statement(ast)
         except ValueError as e:
-            logger.error(f"Failed to parse MERGE in {sql_path}: {e}")
+            logger.error(f"Failed to parse MERGE in {source_label}: {e}")
             return None
 
         target_table = merge_info['target_table']
@@ -3389,7 +3431,7 @@ def process_sql_file(
         try:
             insert_info = parse_insert_statement(ast)
         except ValueError as e:
-            logger.error(f"Failed to parse INSERT in {sql_path}: {e}")
+            logger.error(f"Failed to parse INSERT in {source_label}: {e}")
             return None
 
         target_table = insert_info['target_table']
@@ -3405,7 +3447,7 @@ def process_sql_file(
         stmt_type = "INSERT"
 
     else:
-        logger.error(f"Expected MERGE INTO or INSERT INTO statement in {sql_path}, got {type(ast).__name__}")
+        logger.error(f"Expected MERGE INTO or INSERT INTO statement in {source_label}, got {type(ast).__name__}")
         return None
 
     # -------------------------------------------------------------------------
@@ -3531,6 +3573,44 @@ def process_sql_file(
         return write_output_workbook(result, output_dir, sql_content)
 
 
+def process_sql_file(
+    sql_path: Path,
+    dm_dict: Dict[str, Set[str]],
+    output_dir: Optional[Path] = None,
+    max_depth: int = 50,
+    sql_file_name: str = ""
+) -> Optional[Union[Path, LineageResult]]:
+    """Process a single SQL file (MERGE INTO or INSERT INTO SELECT)."""
+    object_name, sql_content = load_sql_file(sql_path)
+    if not sql_file_name:
+        sql_file_name = sql_path.stem
+    return _process_sql_core(
+        sql_content, object_name, dm_dict, output_dir, max_depth,
+        sql_file_name, source_label=str(sql_path)
+    )
+
+
+def process_sql_text(
+    sql_content: str,
+    object_name: str,
+    dm_dict: Dict[str, Set[str]],
+    output_dir: Optional[Path] = None,
+    max_depth: int = 50,
+    sql_file_name: str = ""
+) -> Optional[Union[Path, LineageResult]]:
+    """Process SQL text directly (not from a file).
+
+    Same as process_sql_file but accepts SQL content as a string.
+    Used by --sql-txt bulk processing mode.
+    """
+    if not sql_file_name:
+        sql_file_name = object_name
+    return _process_sql_core(
+        sql_content, object_name, dm_dict, output_dir, max_depth,
+        sql_file_name, source_label=object_name
+    )
+
+
 def process_batch_with_progress(
     sql_files: List[Path],
     dm_dict: Dict[str, Set[str]],
@@ -3633,6 +3713,76 @@ def process_batch_with_progress(
     # Summary
     print(f"\n{'='*50}")
     print(f"Processed: {total} | Success: {success} | Skipped: {skipped} | Failed: {failed}")
+
+    return outputs
+
+
+def process_bulk_txt_with_progress(
+    queries: List[Tuple[str, str]],
+    dm_dict: Dict[str, Set[str]],
+    output_dir: Path,
+    max_depth: int = 50,
+    separate: bool = False
+) -> List[Path]:
+    """Process multiple SQL queries from a bulk text file.
+
+    Args:
+        queries: List of (object_name, sql_content) tuples from parse_bulk_txt().
+        dm_dict: Data model dictionary.
+        output_dir: Output directory.
+        max_depth: Maximum resolution depth.
+        separate: If True, write separate Excel per query.
+
+    Returns:
+        List of output file paths.
+    """
+    total = len(queries)
+    success = 0
+    failed = 0
+    outputs: List[Path] = []
+    all_results: List[LineageResult] = []
+
+    for i, (object_name, sql_content) in enumerate(queries, 1):
+        print(f"[{i}/{total}] Processing {object_name}...", end='', flush=True)
+
+        try:
+            if separate:
+                result = process_sql_text(
+                    sql_content, object_name, dm_dict, output_dir, max_depth,
+                    sql_file_name=object_name
+                )
+                if result:
+                    print(" OK")
+                    success += 1
+                    outputs.append(result)
+                else:
+                    print(" SKIPPED")
+            else:
+                result = process_sql_text(
+                    sql_content, object_name, dm_dict, None, max_depth,
+                    sql_file_name=object_name
+                )
+                if result and isinstance(result, LineageResult):
+                    print(" OK")
+                    success += 1
+                    all_results.append(result)
+                else:
+                    print(" SKIPPED")
+        except Exception as e:
+            print(f" FAILED: {e}")
+            logger.exception(f"Error processing {object_name}")
+            failed += 1
+
+    # Write combined output
+    if not separate and all_results:
+        print(f"\nWriting combined output...")
+        combined_path = write_combined_excel(all_results, output_dir, dm_dict)
+        if combined_path:
+            outputs.append(combined_path)
+            print(f"Combined output: {combined_path}")
+
+    print(f"\n{'='*50}")
+    print(f"Processed: {total} | Success: {success} | Failed: {failed}")
 
     return outputs
 
@@ -3766,6 +3916,7 @@ Examples:
   %(prog)s --sql T2T_CUSTOMER.sql
   %(prog)s --sql T2T_CUSTOMER.sql --dm-model DM_ATOMIC.xlsx
   %(prog)s --sql-dir sql_files/ --dm-model DM_ATOMIC.xlsx --verbose
+  %(prog)s --sql-txt bulk_queries.txt --dm-model DM_ATOMIC.xlsx --verbose
   %(prog)s --sql-dir sql_files/ --dry-run
         """
     )
@@ -3778,6 +3929,8 @@ Examples:
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument('--sql', type=Path, help='Single SQL file')
     input_group.add_argument('--sql-dir', type=Path, help='Directory of SQL files')
+    input_group.add_argument('--sql-txt', type=Path,
+                             help='Bulk text file with multiple SQL queries (separated by empty lines, object names in /*...*/ comments)')
 
     # Output
     parser.add_argument('--output', type=Path, default=Path('output/'),
@@ -3821,7 +3974,7 @@ Examples:
     logger.info(f"SQL Lineage Parser V2 v{VERSION}")
 
     # Determine SQL source
-    sql_source = args.sql if args.sql else args.sql_dir
+    sql_source = args.sql or args.sql_txt or args.sql_dir
 
     # Dry run mode
     if args.dry_run:
@@ -3841,6 +3994,22 @@ Examples:
         )
         if result:
             print(f"\nOutput: {result}")
+            return 0
+        else:
+            return 1
+    elif args.sql_txt:
+        # Bulk text file mode
+        queries = parse_bulk_txt(args.sql_txt)
+        outputs = process_bulk_txt_with_progress(
+            queries, dm_dict, args.output,
+            args.max_depth, args.separate
+        )
+
+        if outputs:
+            if args.separate:
+                print(f"\nOutputs written to: {args.output}")
+            else:
+                print(f"\nCombined output written to: {args.output}")
             return 0
         else:
             return 1
